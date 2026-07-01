@@ -301,3 +301,378 @@ Override with the `PG_URL` environment variable:
 ```bash
 PG_URL="postgresql://myuser:mypass@myhost:5432/mydb" python demo.py
 ```
+
+---
+
+# PostgreSQL Triggers + Redis Pub/Sub Demo
+
+A companion demo showing how to build an **event-driven pipeline** using PostgreSQL triggers, `LISTEN`/`NOTIFY`, and Redis Pub/Sub.
+
+**File:** `pg_triggers_redis.py`
+
+## Architecture
+
+```
+┌──────────────┐    NOTIFY 'demo_events'  ┌──────────────────┐
+│  PostgreSQL   │ ←─────────────────────→ │  Python Listener  │
+│  (trigger fn) │                         │  (LISTEN/forward) │
+│  on INSERT/   │                         └────────┬─────────┘
+│   UPDATE/     │                                  │ PUBLISH to
+│   DELETE      │                                  │ Redis
+└──────────────┘                           ┌────────┴─────────┐
+                                           │    Redis Pub/Sub  │
+                                           │   (event bus)     │
+                                           └────────┬─────────┘
+                                                    │ SUBSCRIBE
+                                           ┌────────┴─────────┐
+                                           │  Subscriber(s)   │
+                                           │ (other services) │
+                                           └──────────────────┘
+```
+
+## What It Demonstrates
+
+| Component | Technology | Purpose |
+|-----------|-----------|---------|
+| **Trigger: Audit Logging** | PL/pgSQL `AFTER INSERT OR UPDATE OR DELETE` | Auto-log every row change into `demo_orders_audit` with old/new JSONB snapshots |
+| **Trigger: NOTIFY** | `pg_notify('demo_events', payload)` | Send JSON payload on every change to a PostgreSQL channel |
+| **Listener** | `psycopg2` + `LISTEN demo_events` | Python process that listens for notifications in real-time |
+| **Redis Bridge** | `redis-py` pub/sub | Forward events from PostgreSQL to a Redis channel |
+| **Subscriber** | `redis-py` subscriber | Consume events from Redis (simulates downstream services) |
+
+## Quick Start
+
+```bash
+# 1. Install dependencies
+pip install psycopg2-binary redis
+
+# 2. Make sure Redis is running
+redis-server
+
+# 3. Run the full demo
+python pg_triggers_redis.py
+```
+
+The full demo will:
+1. Create `demo_orders` and `demo_orders_audit` tables
+2. Install trigger functions (`fn_demo_orders_audit`, `fn_demo_orders_notify`)
+3. Start a Redis subscriber in a background thread
+4. Start a PostgreSQL listener in a subprocess
+5. Simulate 5 INSERTs, 5 UPDATEs, and 1 DELETE
+6. Show the audit trail and verify Redis event delivery
+
+### Expected Output
+
+```
+🔗  Connected to PostgreSQL …
+
+📦  Creating schema...
+📦  Creating trigger functions...
+📦  Installing triggers...
+  ✅  Schema + triggers ready
+
+════════════════════════════════════════════════════════════
+  🚀  Starting full pipeline demo...
+════════════════════════════════════════════════════════════
+
+📦  Simulating changes on demo_orders...
+
+  ──  INSERT 5 orders ──
+     ✅  Order #1: Alice ordered 2x Widget Alpha
+     ✅  Order #2: Bob ordered 1x Gadget Beta
+     ✅  Order #3: Charlie ordered 5x Widget Alpha
+     ✅  Order #4: Diana ordered 3x Gadget Beta
+     ✅  Order #5: Eve ordered 10x Doohickey Gamma
+
+  ──  UPDATE statuses ──
+     🔄  Order #1: status → 'confirmed'
+     🔄  Order #2: status → 'shipped'
+     🔄  Order #3: status → 'delivered'
+     🔄  Order #4: status → 'pending'
+     🔄  Order #5: status → 'confirmed'
+
+  ──  DELETE 1 order ──
+     🗑️  Order #5: deleted
+
+  ──  Audit trail (demo_orders_audit) ──
+     📝  Order #1: INSERT at 08:30:00.123
+     📝  Order #2: INSERT at 08:30:00.124
+     📝  Order #3: INSERT at 08:30:00.125
+     📝  Order #4: INSERT at 08:30:00.126
+     📝  Order #5: INSERT at 08:30:00.127
+     📝  Order #1: UPDATE at 08:30:00.234
+     📝  Order #2: UPDATE at 08:30:00.235
+     ... (11 audit rows total)
+
+════════════════════════════════════════════════════════════
+  📊  Demo Results
+════════════════════════════════════════════════════════════
+
+  Redis events collected: 11
+
+    •    INSERT  #1  | Order #1: Alice ordered 2x Widget Alpha
+    •    INSERT  #2  | Order #2: Bob ordered 1x Gadget Beta
+    •    INSERT  #3  | Order #3: Charlie ordered 5x Widget Alpha
+    ... (11 events total)
+
+  ✅  Pipeline verified: DB trigger → pg_notify → Python → Redis → subscriber
+```
+
+## Command-Line Options
+
+| Flag | Purpose |
+|------|---------|
+| *(none)* | Run full end-to-end demo |
+| `--setup-only` | Create schema + triggers only |
+| `--listen` | Start pg listener that forwards to Redis |
+| `--simulate` | Insert/update/delete demo data |
+| `--subscribe` | Subscribe to Redis channel and print events |
+| `--cleanup` | Drop all triggers, tables, and Redis data |
+| `PG_URL=...` | Custom PostgreSQL connection string |
+| `REDIS_URL=...` | Custom Redis connection string |
+
+## Trigger Details
+
+### `fn_demo_orders_audit` — Audit Logging
+
+```sql
+CREATE OR REPLACE FUNCTION fn_demo_orders_audit()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        INSERT INTO demo_orders_audit (order_id, action, new_data)
+        VALUES (NEW.id, 'INSERT', row_to_json(NEW)::jsonb);
+    ELSIF TG_OP = 'UPDATE' THEN
+        INSERT INTO demo_orders_audit (order_id, action, old_data, new_data)
+        VALUES (NEW.id, 'UPDATE', row_to_json(OLD)::jsonb, row_to_json(NEW)::jsonb);
+    ELSIF TG_OP = 'DELETE' THEN
+        INSERT INTO demo_orders_audit (order_id, action, old_data)
+        VALUES (OLD.id, 'DELETE', row_to_json(OLD)::jsonb);
+    END IF;
+    RETURN COALESCE(NEW, OLD);
+END;
+$$ LANGUAGE plpgsql;
+```
+
+Fires `AFTER INSERT OR UPDATE OR DELETE` and captures before/after row state as JSONB.
+
+### `fn_demo_orders_notify` — Real-time NOTIFY
+
+```sql
+CREATE OR REPLACE FUNCTION fn_demo_orders_notify()
+RETURNS TRIGGER AS $$
+DECLARE
+    payload TEXT;
+BEGIN
+    payload := json_build_object(
+        'table',   TG_TABLE_NAME,
+        'action',  TG_OP,
+        'id',      COALESCE(NEW.id, OLD.id),
+        'time',    now()::timestamptz,
+        'summary', ...
+    )::text;
+    PERFORM pg_notify('demo_events', payload);
+    RETURN COALESCE(NEW, OLD);
+END;
+$$ LANGUAGE plpgsql;
+```
+
+Builds a JSON payload and sends it via `pg_notify()` to the `demo_events` channel.
+
+## Running Components Separately
+
+In production, you'd run the listener and subscriber as separate services:
+
+```bash
+# Terminal 1 — Redis subscriber (downstream service)
+python pg_triggers_redis.py --subscribe
+
+# Terminal 2 — PostgreSQL listener (event bridge)
+python pg_triggers_redis.py --listen
+
+# Terminal 3 — Simulate changes (any number of times)
+python pg_triggers_redis.py --simulate
+```
+
+## Real-World Use Cases
+
+- **Change Data Capture (CDC)** — Track all changes to critical tables for auditing or replication
+- **Real-time dashboards** — Push order/delivery updates to frontend via WebSocket
+- **Cache invalidation** — Invalidate Redis/Memcached caches when underlying data changes
+- **Event-driven microservices** — Trigger downstream workflows (invoicing, shipping, notifications)
+- **Search index sync** — Update Elasticsearch/Meilisearch when records change
+
+## Project Structure
+
+```
+sqlalchemy_demo/
+├── demo.py                # 12 performance anti-pattern scenarios
+├── pg_triggers_redis.py   # PostgreSQL triggers + Redis pub/sub demo
+└── README.md              # This file
+```
+
+---
+
+## SSE (Server-Sent Events) — Live Browser Updates
+
+The `--serve` flag starts a **FastAPI server** with **two SSE implementations** that push `pg_notify` events to web browsers in real-time:
+
+| Endpoint | Implementation | Dependency |
+|----------|---------------|------------|
+| `GET /events` | `StreamingResponse` (raw SSE protocol) | `fastapi` + `uvicorn` only |
+| `GET /events-starlette` | `EventSourceResponse` (sse-starlette) | `fastapi` + `uvicorn` + `sse-starlette` |
+| `GET /` | HTML dashboard with live event display | (same as above) |
+| `GET /health` | JSON health check | (same as above) |
+
+### Quick Start
+
+```bash
+# 1. Install SSE dependencies
+pip install fastapi uvicorn sse-starlette
+
+# 2. Make sure setup is done (triggers installed)
+python pg_triggers_redis.py --setup-only
+
+# 3. Start the SSE server
+python pg_triggers_redis.py --serve
+```
+
+Then open **http://localhost:8765/** in your browser to see the live dashboard.
+
+### Trigger events in another terminal:
+
+```bash
+python pg_triggers_redis.py --simulate
+```
+
+Each INSERT/UPDATE/DELETE will appear in the browser dashboard in real-time.
+
+### Architecture
+
+```
+┌──────────────┐   NOTIFY 'demo_events'   ┌──────────────────┐
+│  PostgreSQL   │ ───────────────────────→ │  FastAPI Server   │
+│  (trigger fn) │                          │  (background      │
+│  on INSERT/   │                          │   LISTEN thread)  │
+│   UPDATE/     │                          │                   │
+│   DELETE      │                          │  ┌─────────────┐  │
+└──────────────┘                           │  │ asyncio.Queue │  │
+                                           │  └──────┬──────┘  │
+                                           │         │         │
+                                           │  ┌──────┴──────┐  │
+                                           │  │  /events     │  │
+                                           │  │ Streaming    │──│──→ Browser A
+                                           │  │ Response     │  │
+                                           │  ├──────────────┤  │
+                                           │  │ /events-     │  │
+                                           │  │ starlette    │──│──→ Browser B
+                                           │  │ EventSource  │  │
+                                           │  │ Response     │  │
+                                           │  ├──────────────┤  │
+                                           │  │ / (dashboard)│──│──→ Browser C
+                                           │  │ HTML + JS    │  │
+                                           └──────────────────┘
+```
+
+### Two SSE Implementations
+
+#### Approach 1: `StreamingResponse` (pure FastAPI — no extra dependencies)
+
+```python
+from fastapi.responses import StreamingResponse
+
+@app.get("/events")
+async def sse_events(request: Request):
+    async def event_stream():
+        while True:
+            if await request.is_disconnected():
+                break
+            data = await async_queue.get()
+            yield f"event: pg_notify\n"
+            yield f"data: {json.dumps(data)}\n"
+            yield "\n"  # blank line = message delimiter
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+```
+
+The SSE protocol is **plain HTTP**. Each message is:
+
+```
+event: pg_notify
+data: {"action": "INSERT", "id": 1, "summary": "..."}
+
+```
+
+A blank line (`\n`) separates messages. The `StreamingResponse` keeps the connection open and streams data as it becomes available.
+
+#### Approach 2: `EventSourceResponse` (sse-starlette)
+
+```python
+from sse_starlette.sse import EventSourceResponse
+
+@app.get("/events-starlette")
+async def sse_events(request: Request):
+    async def event_generator():
+        while True:
+            if await request.is_disconnected():
+                break
+            data = await async_queue.get()
+            yield {
+                "event": "pg_notify",
+                "data": json.dumps(data),
+            }
+
+    return EventSourceResponse(event_generator())
+```
+
+`EventSourceResponse` is a higher-level abstraction that handles:
+- Proper `Last-Event-ID` tracking for reconnection
+- Automatic ping/heartbeat intervals
+- Connection state management
+- Graceful cleanup on disconnect
+
+### Browser Client (JavaScript)
+
+```javascript
+const evtSource = new EventSource('/events');
+
+evtSource.addEventListener('pg_notify', (e) => {
+    const data = JSON.parse(e.data);
+    console.log(`${data.action} #${data.id}: ${data.summary}`);
+});
+
+evtSource.onerror = () => {
+    console.log('Disconnected — browser auto-reconnects');
+};
+```
+
+The browser `EventSource` API **auto-reconnects** on connection loss, sending the last received event ID so the server can resume from where it left off.
+
+### Run It
+
+```bash
+# Terminal 1 — SSE server
+python pg_triggers_redis.py --serve
+
+# Terminal 2 — Trigger events
+python pg_triggers_redis.py --simulate
+```
+
+Open http://localhost:8765/ for the live dashboard, or connect directly to `/events` or `/events-starlette` with any SSE client.
+
+## Project Structure
+
+```
+sqlalchemy_demo/
+├── demo.py                # 12 performance anti-pattern scenarios
+├── pg_triggers_redis.py   # PostgreSQL triggers + Redis pub/sub + SSE
+└── README.md              # This file
+```
