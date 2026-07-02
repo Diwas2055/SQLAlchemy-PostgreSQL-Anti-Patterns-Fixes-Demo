@@ -169,6 +169,27 @@ def _read_counter(engine: Engine) -> int:
         ).scalar() or 0
 
 
+def _explain(engine: Engine, label: str, sql: str, params: dict[str, Any] | None = None) -> None:
+    """Run EXPLAIN ANALYZE on a SQL statement and print the query plan.
+
+    Uses a raw psycopg2 connection to avoid SQLAlchemy's parameterization
+    interfering with EXPLAIN ANALYZE formatting.
+    """
+    import psycopg2
+    conn = psycopg2.connect(PG_URL)
+    try:
+        cur = conn.cursor()
+        explain_sql = f"EXPLAIN (ANALYZE, COSTS, BUFFERS, FORMAT TEXT) {sql}"
+        cur.execute(explain_sql, params or {})
+        plan = [row[0] for row in cur.fetchall()]
+        print(f"\n  ── EXPLAIN ANALYZE: {label} ──")
+        for line in plan:
+            print(f"    {line}")
+        print()
+    finally:
+        conn.close()
+
+
 def print_benchmark(results: list[ConcurrencyBench], title: str) -> None:
     """Pretty-print concurrency benchmark results."""
     print(f"\n{'=' * 72}")
@@ -258,6 +279,18 @@ def demo_lost_update(engine: Engine) -> None:
     )
     print_benchmark([bad_r, good_r], "SCENARIO 1 — Lost Update: No Locking vs SELECT FOR UPDATE")
 
+    # ── EXPLAIN ANALYZE: Compare query plans ──────────────────────────────────
+    print(f"  {'─' * 68}")
+    print(f"  EXPLAIN ANALYZE — how PostgreSQL executes each approach:")
+    _explain(engine, "BAD — Plain SELECT (no lock)",
+             "SELECT count FROM concurrency_counter WHERE id = 1")
+    _explain(engine, "GOOD — SELECT FOR UPDATE (row lock)",
+             "SELECT count FROM concurrency_counter WHERE id = 1 FOR UPDATE")
+    print(f"  {'─' * 68}")
+    print(f"  KEY INSIGHT: Both plans look similar, but FOR UPDATE adds a\n"
+          f"  RowLock on the selected row — visible in the lock tag.\n"
+          f"  This lock prevents concurrent writes until the transaction commits.\n")
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # SCENARIO 2 — Read-Modify-Write vs Atomic SQL UPDATE
@@ -325,6 +358,20 @@ def demo_atomic_update(engine: Engine) -> None:
         note="1 round-trip — DB does increment internally",
     )
     print_benchmark([bad_r, good_r], "SCENARIO 2 — Read-Modify-Write vs Atomic SQL UPDATE")
+
+    # ── EXPLAIN ANALYZE: 2 round-trips vs 1 ───────────────────────────────────
+    print(f"  {'─' * 68}")
+    print(f"  EXPLAIN ANALYZE — comparing round-trips:")
+    _explain(engine, "BAD — SELECT FOR UPDATE (1st round-trip)",
+             "SELECT count FROM concurrency_counter WHERE id = 1 FOR UPDATE")
+    _explain(engine, "BAD — UPDATE (2nd round-trip, uses PK)",
+             "UPDATE concurrency_counter SET count = 5 WHERE id = 1")
+    _explain(engine, "GOOD — Atomic UPDATE count = count + 1 (1 round-trip)",
+             "UPDATE concurrency_counter SET count = count + 1 WHERE id = 1")
+    print(f"  {'─' * 68}")
+    print(f"  KEY INSIGHT: The atomic UPDATE avoids the separate SELECT entirely.\n"
+          f"  Both UPDATE plans are similar, but the GOOD approach cuts\n"
+          f"  network round-trips in half — critical at high concurrency.\n")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -406,6 +453,18 @@ def demo_optimistic_cc(engine: Engine) -> None:
         note="Correct count; retries add overhead under high contention",
     )
     print_benchmark([bad_r, good_r], "SCENARIO 3 — Optimistic Concurrency Control (Version Column)")
+
+    # ── EXPLAIN ANALYZE: Version column UPDATE vs plain UPDATE ─────────────────
+    print(f"  {'─' * 68}")
+    print(f"  EXPLAIN ANALYZE — how version column prevents silent overwrites:")
+    _explain(engine, "GOOD — UPDATE with version check (0 rows if stale)",
+             "UPDATE concurrency_counter SET count = count + 1, version = version + 1 "
+             "WHERE id = 1 AND version = 1")
+    print(f"  {'─' * 68}")
+    print(f"  KEY INSIGHT: The version check in WHERE is a B-tree index lookup\n"
+          f"  on the PK — same cost as a normal UPDATE. The difference is that\n"
+          f"  when version doesn't match, rowcount = 0 and the app retries.\n"
+          f"  No row locks are held during the application processing window.\n")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -511,6 +570,24 @@ def demo_insert_race(engine: Engine) -> None:
     )
     print_benchmark([bad_r, good_r], "SCENARIO 4 — INSERT Race: App-level Check vs Upsert")
 
+    # ── EXPLAIN ANALYZE: INSERT plans with and without conflict handling ───────
+    print(f"  {'─' * 68}")
+    print(f"  EXPLAIN ANALYZE — how PostgreSQL enforces uniqueness:")
+    _explain(engine, "BAD — Plain INSERT (no constraint, race wins)",
+             "INSERT INTO concurrency_users (email, name) "
+             "VALUES ('explain-test@example.com', 'Test')")
+    _explain(engine, "GOOD — INSERT ON CONFLICT DO NOTHING (atomic guard)",
+             "INSERT INTO concurrency_users (email, name) "
+             "VALUES ('explain-test@example.com', 'Test') "
+             "ON CONFLICT (email) DO NOTHING")
+    # Clean up the explain test row
+    with engine.begin() as conn:
+        conn.execute(users.delete().where(users.c.email == "explain-test@example.com"))
+    print(f"  {'─' * 68}")
+    print(f"  KEY INSIGHT: The ON CONFLICT clause adds an anti-join step that\n"
+          f"  atomically checks for existing rows. No race window — the DB\n"
+          f"  handles the check and insert as one uninterruptible operation.\n")
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # SCENARIO 5 — Distributed Lock: No Coordination vs Advisory Lock
@@ -589,6 +666,20 @@ def demo_advisory_lock(engine: Engine) -> None:
         note="Lock works across ALL connections — even from different processes",
     )
     print_benchmark([bad_r, good_r], "SCENARIO 5 — Distributed Lock: No Coordination vs Advisory Lock")
+
+    # ── EXPLAIN ANALYZE: Advisory lock acquisition ─────────────────────────────
+    print(f"  {'─' * 68}")
+    print(f"  EXPLAIN ANALYZE — PostgreSQL advisory lock in action:")
+    _explain(engine, "GOOD — Acquire transaction-level advisory lock",
+             "SELECT pg_advisory_xact_lock(12345)")
+    _explain(engine, "GOOD — Read inside the lock (same as FOR UPDATE)",
+             "SELECT count FROM concurrency_counter WHERE id = 1 FOR UPDATE")
+    print(f"  {'─' * 68}")
+    print(f"  KEY INSIGHT: pg_advisory_xact_lock() acquires a database-level\n"
+          f"  mutex that works across ALL connections, processes, and servers.\n"
+          f"  Unlike FOR UPDATE (which locks a row), this locks an abstract\n"
+          f"  integer key — useful for non-row resources like API rate limits.\n"
+          f"  Lock auto-releases on COMMIT/ROLLBACK.\n")
 
 
 # ──────────────────────────────────────────────────────────────────────────────

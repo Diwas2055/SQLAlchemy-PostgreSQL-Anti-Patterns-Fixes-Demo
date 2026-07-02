@@ -1,0 +1,27 @@
+[tool.migrations]
+# ── Database ─────────────────────────────────────────────────────────────────
+# PostgreSQL connection string (overridable via PG_URL env var)
+database_url = "postgresql://postgres:postgres@localhost:5432/sqlalchemy_demo"
+
+# ── Migration storage ────────────────────────────────────────────────────────
+# PostgreSQL table that tracks which migrations have been applied
+migrations_table = "_schema_migrations"
+
+# Directory where migration version files are stored (relative to this file)
+versions_dir = "versions"
+
+# ── Behavior ──────────────────────────────────────────────────────────────────
+# Automatically detect schema changes from SQLAlchemy models
+auto_generate = true
+
+# Echo SQLAlchemy queries for debugging
+sqlalchemy_echo = false
+
+# ── PostgreSQL-specific ───────────────────────────────────────────────────────
+# Which database schema to inspect
+postgres_schema = "public"
+
+
+# ── Script (so Cleo can find the CLI) ─────────────────────────────────────────
+[tool.migrations.scripts]
+migrate = "migrations.cli:main"
