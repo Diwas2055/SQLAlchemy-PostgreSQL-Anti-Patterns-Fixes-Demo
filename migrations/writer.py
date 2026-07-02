@@ -79,19 +79,22 @@ def write_migration(
 
     # ── Format SQL into indented function bodies ──────────────────────────────
     def _indent(stmts: list[str], level: int = 2) -> str:
-        """Indent SQL statements for embedding in Python."""
+        """Indent SQL statements for embedding in Python.
+
+        Produces clean output like::
+
+            connection.execute("CREATE TABLE ...")
+            connection.execute("ALTER TABLE ...")
+        """
         if not stmts:
             return "    pass"
         lines = []
         for stmt in stmts:
-            lines.append(f"{' ' * (level * 2)}{stmt!r},")
-            lines.append(f"{' ' * (level * 2)}connection.execute({stmt!r})" if not stmt.startswith("--") else "")
-        # Clean up empty lines from comment statements
-        result = []
-        for line in lines:
-            if line.strip():
-                result.append(line)
-        return "\n".join(result) if result else "    pass"
+            if stmt.startswith("--"):
+                lines.append(f"{' ' * (level * 2)}# {stmt[3:].lstrip()}")
+            else:
+                lines.append(f"{' ' * (level * 2)}connection.execute({stmt!r})")
+        return "\n".join(lines) if lines else "    pass"
 
     upgrade_code = _indent(upgrade_sql)
     downgrade_code = _indent(downgrade_sql)

@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any
 
 from sqlalchemy import Table as SATable, text
 from sqlalchemy.engine import Engine
@@ -155,22 +155,23 @@ def _get_model_tables() -> dict[str, SATable]:
 
 def _pg_type(col_type: Any) -> str:
     """Map a SQLAlchemy type to a PostgreSQL udt_name string."""
+    # Handle ARRAY types first — they have an item_type attribute
+    if hasattr(col_type, "item_type"):
+        inner = _pg_type(col_type.item_type)
+        return f"_{inner}" if not inner.startswith("_") else f"_{inner}"
+
     type_class = col_type.__class__.__name__.lower()
     mapping = {
         "integer": "int4",
-        "string": "text",
-        "text": "text",
+        "string":  "text",
+        "text":    "text",
         "boolean": "bool",
-        "float": "float8",
+        "float":   "float8",
         "numeric": "numeric",
         "datetime": "timestamp",
-        "date": "date",
+        "date":    "date",
         "largebinary": "bytea",
-        "array": "text",       # ARRAY(Text) stores as text[]
     }
-    # Handle ARRAY types
-    if hasattr(col_type, "item_type"):
-        return f"_{mapping.get(col_type.item_type.__class__.__name__.lower(), 'text')}"
     return mapping.get(type_class, "text")
 
 
@@ -246,11 +247,39 @@ def detect_changes(engine: Engine, schema: str = "public") -> SchemaDiff:
 # SQL generation
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _pg_sql_type(col_type: Any) -> str:
+    """Render a SQLAlchemy type as a PostgreSQL DDL type string.
+
+    Handles INTEGER, TEXT, BOOLEAN, ARRAY -> type[], etc.
+    """
+    if hasattr(col_type, "item_type"):
+        inner = _pg_sql_type(col_type.item_type)
+        return f"{inner}[]"
+    type_class = col_type.__class__.__name__.upper()
+    mapping = {
+        "INTEGER": "INTEGER",
+        "STRING":  "TEXT",
+        "TEXT":    "TEXT",
+        "BOOLEAN": "BOOLEAN",
+        "FLOAT":   "FLOAT",
+        "NUMERIC": "NUMERIC",
+        "DATETIME": "TIMESTAMP",
+        "DATE":    "DATE",
+        "LARGEBINARY": "BYTEA",
+    }
+    return mapping.get(type_class, "TEXT")
+
+
 def generate_sql(diff: SchemaDiff) -> tuple[list[str], list[str]]:
     """Generate PostgreSQL SQL for upgrade and downgrade from a SchemaDiff.
 
+    Properly handles: columns, nullability, defaults, primary keys,
+    foreign keys, and unique constraints.
+
     Returns (upgrade_sql, downgrade_sql) — lists of SQL statements.
     """
+    from sqlalchemy import ForeignKeyConstraint, UniqueConstraint, PrimaryKeyConstraint
+
     up: list[str] = []
     down: list[str] = []
 
@@ -258,29 +287,84 @@ def generate_sql(diff: SchemaDiff) -> tuple[list[str], list[str]]:
 
     for tname in diff.new_tables:
         table = model_tables[tname]
-        # Generate CREATE TABLE
         col_defs: list[str] = []
+        standalone_fk: list[str] = []   # FK added as separate ALTER TABLE
+        standalone_uq: list[str] = []   # UQ added as separate ALTER TABLE
+
         for col in table.columns:
-            nullable = " NOT NULL" if not col.nullable else ""
-            default = ""
+            parts: list[str] = [f"    {col.name} {_pg_sql_type(col.type)}"]
+
+            if not col.nullable:
+                parts.append("NOT NULL")
+
             if col.server_default is not None:
-                default = f" DEFAULT {col.server_default.arg}"
-            col_defs.append(f"    {col.name} {col.type}{nullable}{default}")
+                default_raw = col.server_default.arg
+                # Numeric strings like '0', '1' should not be quoted
+                if isinstance(default_raw, str):
+                    try:
+                        int(default_raw)
+                        parts.append(f"DEFAULT {default_raw}")
+                    except ValueError:
+                        try:
+                            float(default_raw)
+                            parts.append(f"DEFAULT {default_raw}")
+                        except ValueError:
+                            # String default — quote it, unless it's a function call
+                            if default_raw.startswith("NOW") or default_raw.endswith("()"):
+                                parts.append(f"DEFAULT {default_raw}")
+                            else:
+                                parts.append(f"DEFAULT '{default_raw}'")
+                else:
+                    parts.append(f"DEFAULT {default_raw}")
 
-        # Primary key
-        pk_cols = [c.name for c in table.columns if c.primary_key]
-        if pk_cols:
-            pk_def = f",\n    PRIMARY KEY ({', '.join(pk_cols)})"
-        else:
-            pk_def = ""
+            col_defs.append(" ".join(parts))
 
-        # Unique constraints
+        # ── Constraints ───────────────────────────────────────────────────────
+        pk_cols: list[str] = []
         for constr in table.constraints:
-            if isinstance(constr, type(table.constraints[0])) and False:
-                pass  # Handle constraints generically
-        # Simplified: just create the table
-        create = f"CREATE TABLE {tname} (\n{',\n'.join(col_defs)}{pk_def}\n);"
+            if isinstance(constr, PrimaryKeyConstraint):
+                pk_cols = [c.name for c in constr.columns]
+            elif isinstance(constr, ForeignKeyConstraint):
+                # Emit each FK element as a separate ALTER TABLE
+                for fk_elem in constr.elements:
+                    local_col = fk_elem.parent.name
+                    ref_col_name = fk_elem.column.name
+                    ref_table_name = fk_elem.column.table.name
+                    standalone_fk.append(
+                        f"ALTER TABLE {tname} "
+                        f"ADD CONSTRAINT fk_{tname}_{local_col} "
+                        f"FOREIGN KEY ({local_col}) "
+                        f"REFERENCES {ref_table_name}({ref_col_name});"
+                    )
+            elif isinstance(constr, UniqueConstraint):
+                uq_cols = [c.name for c in constr.columns]
+                uq_name = constr.name or f"uq_{tname}_{'_'.join(uq_cols)}"
+                standalone_uq.append(
+                    f"ALTER TABLE {tname} "
+                    f"ADD CONSTRAINT {uq_name} UNIQUE ({', '.join(uq_cols)});"
+                )
+
+        if pk_cols:
+            col_defs.append(f"    PRIMARY KEY ({', '.join(pk_cols)})")
+
+        create = f"CREATE TABLE {tname} (\n{',\n'.join(col_defs)}\n);"
         up.append(create)
+
+        # FK and UQ as separate ALTER TABLE statements
+        for fk_stmt in standalone_fk:
+            up.append(fk_stmt)
+        for uq_stmt in standalone_uq:
+            up.append(uq_stmt)
+
+        # Downgrade: drop constraints BEFORE dropping the table
+        for uq_stmt in reversed(standalone_uq):
+            parts = uq_stmt.split()
+            cname = parts[parts.index("CONSTRAINT") + 1]
+            down.append(f"ALTER TABLE {tname} DROP CONSTRAINT IF EXISTS {cname};")
+        for fk_stmt in reversed(standalone_fk):
+            parts = fk_stmt.split()
+            cname = parts[parts.index("CONSTRAINT") + 1]
+            down.append(f"ALTER TABLE {tname} DROP CONSTRAINT IF EXISTS {cname};")
         down.append(f"DROP TABLE IF EXISTS {tname} CASCADE;")
 
     for change in diff.column_changes:
@@ -294,7 +378,7 @@ def generate_sql(diff: SchemaDiff) -> tuple[list[str], list[str]]:
                 f"DROP COLUMN IF EXISTS {change.column};"
             )
         elif change.change_type == "drop":
-            # Flagged but we don't auto-drop columns (too dangerous)
+            # Flagged but we don't auto-drop columns (too dangerous — data loss)
             pass
         elif change.change_type == "alter_type":
             up.append(

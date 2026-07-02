@@ -73,15 +73,7 @@ class InitCommand(Command):
         ensure_tracking_table(engine, cfg.migrations_table)
         self.line(f"  ✅  Tracking table <info>{cfg.migrations_table}</info> ready")
 
-        # Create initial migration with all current models
-        from migrations.models import ALL_MODELS
-        from sqlalchemy import MetaData
-        meta = MetaData()
-        for model in ALL_MODELS:
-            # Reflect model tables into metadata for creation
-            pass
-
-        # Create all tables
+        # Create all model tables
         from migrations.models import Base
         Base.metadata.create_all(engine)
         self.line(f"  ✅  All model tables created ({len(ALL_MODELS)} tables)")

@@ -69,7 +69,6 @@ def ensure_tracking_table(engine: Engine, table_name: str) -> None:
 
 def get_applied_migrations(engine: Engine, table_name: str) -> list[MigrationRecord]:
     """Return all applied migrations, ordered by batch then id."""
-    from dataclasses import dataclass as _dataclass
     with engine.connect() as conn:
         rows = conn.execute(
             text(
@@ -269,17 +268,29 @@ def rollback_migrations(cfg: MigrationConfig, steps: int = 1) -> None:
                 remove_migration_record(engine, cfg.migrations_table, rec.id)
                 print(f"     ✅  Rolled back")
             else:
-                print(f"     ⚠️  No downgrade function, removing record only")
-                remove_migration_record(engine, cfg.migrations_table, rec.id)
+                raise RuntimeError(
+                    f"Cannot roll back {rec.id}: no downgrade() function found. "
+                    f"The tracking record will NOT be deleted — fix the migration "
+                    f"file or add a downgrade function manually."
+                )
 
     engine.dispose()
     print(f"\n  ✅  Rollback complete.\n")
 
 
 def show_status(cfg: MigrationConfig) -> None:
-    """Print the current migration status."""
+    """Print the current migration status (read-only — no side effects)."""
     engine = _get_engine(cfg)
-    ensure_tracking_table(engine, cfg.migrations_table)
+
+    # First check if the tracking table exists — if not, nothing is applied
+    from sqlalchemy import inspect as sa_inspect
+    inspector = sa_inspect(engine)
+    if not inspector.has_table(cfg.migrations_table, schema=cfg.postgres_schema):
+        print(f"\n  ℹ️   Tracking table <comment>{cfg.migrations_table}</comment> does not exist.")
+        print(f"       Run <info>init</info> first to create it.\n")
+        engine.dispose()
+        return
+
     applied = get_applied_migrations(engine, cfg.migrations_table)
     applied_ids = {r.id for r in applied}
     files = load_migration_files(cfg.versions_dir)
